@@ -9,6 +9,11 @@
 (define-constant err-dispute-exists (err u105))
 (define-constant err-dispute-resolved (err u106))
 (define-constant err-non-transferable (err u107))
+(define-constant err-milestone-not-found (err u108))
+(define-constant err-milestone-completed (err u109))
+(define-constant err-insufficient-funds (err u110))
+(define-constant err-milestone-not-funded (err u111))
+(define-constant err-invalid-milestone-index (err u112))
 
 (define-data-var last-token-id uint u0)
 (define-data-var dao-address (optional principal) none)
@@ -46,9 +51,24 @@
 })
 
 (define-data-var last-dispute-id uint u0)
+(define-data-var last-milestone-id uint u0)
 
 (define-map multisig-confirmations {token-id: uint, confirmer: principal} bool)
 (define-map multisig-required-confirmations uint uint)
+
+(define-map milestones uint {
+    client: principal,
+    freelancer: principal,
+    description: (string-ascii 256),
+    amount: uint,
+    funded: bool,
+    completed: bool,
+    completion-time: (optional uint),
+    project-id: (optional uint)
+})
+
+(define-map project-milestones uint (list 10 uint))
+(define-map escrow-balances {milestone-id: uint} uint)
 
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
@@ -88,6 +108,18 @@
 
 (define-read-only (get-platform-fee)
     (var-get platform-fee)
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? milestones milestone-id)
+)
+
+(define-read-only (get-project-milestones (project-id uint))
+    (default-to (list) (map-get? project-milestones project-id))
+)
+
+(define-read-only (get-escrow-balance (milestone-id uint))
+    (default-to u0 (map-get? escrow-balances {milestone-id: milestone-id}))
 )
 
 (define-read-only (calculate-reputation (freelancer principal))
@@ -289,5 +321,105 @@
             has-dispute: (is-some (get dispute-id metadata))
         })
         (err err-not-found)
+    )
+)
+
+(define-public (create-milestone 
+    (client principal)
+    (freelancer principal)
+    (description (string-ascii 256))
+    (amount uint)
+    (project-id (optional uint)))
+    (let ((milestone-id (+ (var-get last-milestone-id) u1)))
+        (asserts! (is-eq tx-sender client) err-unauthorized)
+        (asserts! (> amount u0) err-insufficient-funds)
+        
+        (map-set milestones milestone-id {
+            client: client,
+            freelancer: freelancer,
+            description: description,
+            amount: amount,
+            funded: false,
+            completed: false,
+            completion-time: none,
+            project-id: project-id
+        })
+        
+        (match project-id
+            pid (let ((current-milestones (get-project-milestones pid)))
+                (map-set project-milestones pid 
+                    (unwrap-panic (as-max-len? (append current-milestones milestone-id) u10))))
+            true)
+        
+        (var-set last-milestone-id milestone-id)
+        (ok milestone-id)
+    )
+)
+
+(define-public (fund-milestone (milestone-id uint))
+    (let ((milestone (unwrap! (get-milestone milestone-id) err-milestone-not-found)))
+        (asserts! (is-eq tx-sender (get client milestone)) err-unauthorized)
+        (asserts! (not (get funded milestone)) err-milestone-completed)
+        
+        (let ((payment-amount (get amount milestone)))
+            (unwrap! (stx-transfer? payment-amount tx-sender (as-contract tx-sender)) 
+                    err-insufficient-funds)
+            
+            (map-set milestones milestone-id (merge milestone {funded: true}))
+            (map-set escrow-balances {milestone-id: milestone-id} payment-amount)
+            (ok true)
+        )
+    )
+)
+
+(define-public (complete-milestone (milestone-id uint))
+    (let ((milestone (unwrap! (get-milestone milestone-id) err-milestone-not-found)))
+        (asserts! (is-eq tx-sender (get freelancer milestone)) err-unauthorized)
+        (asserts! (get funded milestone) err-milestone-not-funded)
+        (asserts! (not (get completed milestone)) err-milestone-completed)
+        
+        (map-set milestones milestone-id (merge milestone {
+            completed: true,
+            completion-time: (some stacks-block-height)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (release-milestone-payment (milestone-id uint))
+    (let ((milestone (unwrap! (get-milestone milestone-id) err-milestone-not-found))
+          (escrow-amount (get-escrow-balance milestone-id)))
+        (asserts! (is-eq tx-sender (get client milestone)) err-unauthorized)
+        (asserts! (get completed milestone) err-milestone-not-funded)
+        (asserts! (> escrow-amount u0) err-insufficient-funds)
+        
+        (let ((platform-fee-amount (/ (* escrow-amount (var-get platform-fee)) u10000))
+              (freelancer-payment (- escrow-amount platform-fee-amount)))
+            
+            (as-contract (unwrap! (stx-transfer? freelancer-payment tx-sender (get freelancer milestone)) 
+                                 err-insufficient-funds))
+            (as-contract (unwrap! (stx-transfer? platform-fee-amount tx-sender contract-owner) 
+                                 err-insufficient-funds))
+            
+            (map-delete escrow-balances {milestone-id: milestone-id})
+            (ok true)
+        )
+    )
+)
+
+(define-public (emergency-withdraw (milestone-id uint))
+    (let ((milestone (unwrap! (get-milestone milestone-id) err-milestone-not-found))
+          (escrow-amount (get-escrow-balance milestone-id)))
+        (asserts! (or (is-eq tx-sender contract-owner)
+                     (and (is-eq tx-sender (get client milestone))
+                          (> (- stacks-block-height (default-to u0 (get completion-time milestone))) u1000)))
+                 err-unauthorized)
+        (asserts! (> escrow-amount u0) err-insufficient-funds)
+        
+        (as-contract (unwrap! (stx-transfer? escrow-amount tx-sender (get client milestone)) 
+                             err-insufficient-funds))
+        
+        (map-delete escrow-balances {milestone-id: milestone-id})
+        (ok true)
     )
 )
