@@ -14,6 +14,8 @@
 (define-constant err-insufficient-funds (err u110))
 (define-constant err-milestone-not-funded (err u111))
 (define-constant err-invalid-milestone-index (err u112))
+(define-constant err-skill-not-found (err u113))
+(define-constant err-insufficient-skill-jobs (err u114))
 
 (define-data-var last-token-id uint u0)
 (define-data-var dao-address (optional principal) none)
@@ -70,6 +72,23 @@
 (define-map project-milestones uint (list 10 uint))
 (define-map escrow-balances {milestone-id: uint} uint)
 
+(define-map skill-categories uint {
+    name: (string-ascii 64),
+    min-jobs-required: uint,
+    min-average-rating: uint
+})
+
+(define-map freelancer-skills {freelancer: principal, skill-id: uint} {
+    jobs-completed: uint,
+    total-rating: uint,
+    average-rating: uint,
+    certified: bool,
+    certification-date: (optional uint)
+})
+
+(define-map job-skills uint (list 5 uint))
+(define-data-var last-skill-id uint u0)
+
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
 )
@@ -122,6 +141,22 @@
     (default-to u0 (map-get? escrow-balances {milestone-id: milestone-id}))
 )
 
+(define-read-only (get-skill-category (skill-id uint))
+    (map-get? skill-categories skill-id)
+)
+
+(define-read-only (get-freelancer-skill (freelancer principal) (skill-id uint))
+    (map-get? freelancer-skills {freelancer: freelancer, skill-id: skill-id})
+)
+
+(define-read-only (get-job-skills (token-id uint))
+    (default-to (list) (map-get? job-skills token-id))
+)
+
+(define-read-only (get-last-skill-id)
+    (var-get last-skill-id)
+)
+
 (define-read-only (calculate-reputation (freelancer principal))
     (let ((portfolio (get-freelancer-portfolio freelancer)))
         (fold calculate-single-rating portfolio {total-rating: u0, job-count: u0})
@@ -146,7 +181,8 @@
     (job-title (string-ascii 128))
     (job-description (string-ascii 512))
     (rating uint)
-    (payment-amount uint))
+    (payment-amount uint)
+    (skill-ids (list 5 uint)))
     (let ((token-id (+ (var-get last-token-id) u1)))
         (asserts! (or (is-eq tx-sender client) (is-eq tx-sender contract-owner)) err-unauthorized)
         (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
@@ -165,10 +201,13 @@
             dispute-id: none
         })
         
+        (map-set job-skills token-id skill-ids)
+        
         (unwrap-panic (update-client-jobs client token-id))
         (unwrap-panic (update-freelancer-portfolio freelancer token-id))
         (unwrap-panic (update-total-earnings freelancer payment-amount))
         (unwrap-panic (update-reputation-score freelancer rating))
+        (unwrap-panic (update-freelancer-skills freelancer skill-ids rating))
         
         (var-set last-token-id token-id)
         (ok token-id)
@@ -209,6 +248,34 @@
             total-earnings: current-total-earnings
         })
         (ok true)
+    )
+)
+
+(define-private (update-freelancer-skills (freelancer principal) (skill-ids (list 5 uint)) (rating uint))
+    (begin
+        (fold update-skill-with-context skill-ids {freelancer: freelancer, rating: rating, success: true})
+        (ok true)
+    )
+)
+
+(define-private (update-skill-with-context (skill-id uint) (context {freelancer: principal, rating: uint, success: bool}))
+    (let ((freelancer (get freelancer context))
+          (rating (get rating context))
+          (current-skill (default-to 
+              {jobs-completed: u0, total-rating: u0, average-rating: u0, certified: false, certification-date: none}
+              (get-freelancer-skill freelancer skill-id)))
+          (new-jobs-completed (+ (get jobs-completed current-skill) u1))
+          (new-total-rating (+ (get total-rating current-skill) rating))
+          (new-average-rating (/ new-total-rating new-jobs-completed)))
+        
+        (map-set freelancer-skills {freelancer: freelancer, skill-id: skill-id} {
+            jobs-completed: new-jobs-completed,
+            total-rating: new-total-rating,
+            average-rating: new-average-rating,
+            certified: (get certified current-skill),
+            certification-date: (get certification-date current-skill)
+        })
+        {freelancer: freelancer, rating: rating, success: true}
     )
 )
 
@@ -421,5 +488,65 @@
         
         (map-delete escrow-balances {milestone-id: milestone-id})
         (ok true)
+    )
+)
+
+(define-public (create-skill-category 
+    (name (string-ascii 64))
+    (min-jobs-required uint)
+    (min-average-rating uint))
+    (let ((skill-id (+ (var-get last-skill-id) u1)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and (>= min-average-rating u1) (<= min-average-rating u5)) err-invalid-rating)
+        (asserts! (> min-jobs-required u0) err-insufficient-skill-jobs)
+        
+        (map-set skill-categories skill-id {
+            name: name,
+            min-jobs-required: min-jobs-required,
+            min-average-rating: min-average-rating
+        })
+        
+        (var-set last-skill-id skill-id)
+        (ok skill-id)
+    )
+)
+
+(define-public (certify-skill (freelancer principal) (skill-id uint))
+    (let ((skill-category (unwrap! (get-skill-category skill-id) err-skill-not-found))
+          (freelancer-skill (default-to 
+              {jobs-completed: u0, total-rating: u0, average-rating: u0, certified: false, certification-date: none}
+              (get-freelancer-skill freelancer skill-id))))
+        
+        (asserts! (>= (get jobs-completed freelancer-skill) (get min-jobs-required skill-category)) err-insufficient-skill-jobs)
+        (asserts! (>= (get average-rating freelancer-skill) (get min-average-rating skill-category)) err-invalid-rating)
+        (asserts! (not (get certified freelancer-skill)) err-already-exists)
+        
+        (map-set freelancer-skills {freelancer: freelancer, skill-id: skill-id} 
+            (merge freelancer-skill {
+                certified: true,
+                certification-date: (some stacks-block-height)
+            }))
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-freelancer-certifications (freelancer principal))
+    (let ((skill-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (filter is-certified-skill 
+            (map get-skill-with-id skill-ids))
+    )
+)
+
+(define-private (get-skill-with-id (skill-id uint))
+    {skill-id: skill-id, 
+     freelancer: tx-sender}
+)
+
+(define-private (is-certified-skill (skill-data {skill-id: uint, freelancer: principal}))
+    (let ((skill (get-freelancer-skill (get freelancer skill-data) (get skill-id skill-data))))
+        (match skill
+            s (get certified s)
+            false)
     )
 )
