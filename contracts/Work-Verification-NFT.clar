@@ -550,3 +550,286 @@
             false)
     )
 )
+
+;; Project Templates System - New Independent Feature
+(define-constant err-template-not-found (err u115))
+(define-constant err-invalid-template-id (err u116))
+(define-constant err-template-already-exists (err u117))
+(define-constant err-invalid-milestone-count (err u118))
+(define-constant err-template-in-use (err u119))
+
+(define-data-var last-template-id uint u0)
+
+(define-map project-templates uint {
+    creator: principal,
+    name: (string-ascii 128),
+    description: (string-ascii 512),
+    category: (string-ascii 64),
+    estimated-duration: uint,
+    total-budget-range: {min: uint, max: uint},
+    required-skills: (list 5 uint),
+    milestone-count: uint,
+    milestone-percentages: (list 10 uint),
+    created-at: uint,
+    usage-count: uint,
+    rating: uint,
+    active: bool
+})
+
+(define-map template-reviews {template-id: uint, reviewer: principal} {
+    rating: uint,
+    comment: (string-ascii 256),
+    created-at: uint
+})
+
+(define-map template-milestones {template-id: uint, milestone-index: uint} {
+    title: (string-ascii 128),
+    description: (string-ascii 256),
+    deliverables: (string-ascii 512),
+    percentage: uint
+})
+
+(define-map user-templates principal (list 20 uint))
+(define-map template-usage-history uint (list 50 principal))
+
+;; Read-only functions for Project Templates
+(define-read-only (get-template (template-id uint))
+    (map-get? project-templates template-id)
+)
+
+(define-read-only (get-template-milestone (template-id uint) (milestone-index uint))
+    (map-get? template-milestones {template-id: template-id, milestone-index: milestone-index})
+)
+
+(define-read-only (get-template-review (template-id uint) (reviewer principal))
+    (map-get? template-reviews {template-id: template-id, reviewer: reviewer})
+)
+
+(define-read-only (get-user-templates (user principal))
+    (default-to (list) (map-get? user-templates user))
+)
+
+(define-read-only (get-template-usage-history (template-id uint))
+    (default-to (list) (map-get? template-usage-history template-id))
+)
+
+(define-read-only (get-last-template-id)
+    (var-get last-template-id)
+)
+
+(define-read-only (get-popular-templates (category (string-ascii 64)))
+    (ok "Feature requires off-chain indexing for category filtering")
+)
+
+;; Public functions for Project Templates
+(define-public (create-project-template 
+    (name (string-ascii 128))
+    (description (string-ascii 512))
+    (category (string-ascii 64))
+    (estimated-duration uint)
+    (budget-min uint)
+    (budget-max uint)
+    (required-skills (list 5 uint))
+    (milestone-titles (list 10 (string-ascii 128)))
+    (milestone-descriptions (list 10 (string-ascii 256)))
+    (milestone-deliverables (list 10 (string-ascii 512)))
+    (milestone-percentages (list 10 uint)))
+    (let ((template-id (+ (var-get last-template-id) u1))
+          (milestone-count (len milestone-percentages))
+          (total-percentage (fold + milestone-percentages u0)))
+        
+        (asserts! (> milestone-count u0) err-invalid-milestone-count)
+        (asserts! (<= milestone-count u10) err-invalid-milestone-count)
+        (asserts! (is-eq total-percentage u100) err-invalid-milestone-count)
+        (asserts! (< budget-min budget-max) err-insufficient-funds)
+        
+        (map-set project-templates template-id {
+            creator: tx-sender,
+            name: name,
+            description: description,
+            category: category,
+            estimated-duration: estimated-duration,
+            total-budget-range: {min: budget-min, max: budget-max},
+            required-skills: required-skills,
+            milestone-count: milestone-count,
+            milestone-percentages: milestone-percentages,
+            created-at: stacks-block-height,
+            usage-count: u0,
+            rating: u0,
+            active: true
+        })
+        
+        (unwrap-panic (process-template-milestones template-id milestone-titles milestone-descriptions milestone-deliverables milestone-percentages))
+        (unwrap-panic (add-template-to-user tx-sender template-id))
+        
+        (var-set last-template-id template-id)
+        (ok template-id)
+    )
+)
+
+(define-private (process-template-milestones
+    (template-id uint)
+    (titles (list 10 (string-ascii 128)))
+    (descriptions (list 10 (string-ascii 256)))
+    (deliverables (list 10 (string-ascii 512)))
+    (percentages (list 10 uint)))
+    (let ((milestone-count (len titles)))
+        (fold store-milestone-data 
+            (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+            {template-id: template-id, 
+             titles: titles, 
+             descriptions: descriptions, 
+             deliverables: deliverables, 
+             percentages: percentages, 
+             count: milestone-count,
+             success: true})
+        (ok true)
+    )
+)
+
+(define-private (store-milestone-data 
+    (index uint) 
+    (context {template-id: uint, titles: (list 10 (string-ascii 128)), descriptions: (list 10 (string-ascii 256)), deliverables: (list 10 (string-ascii 512)), percentages: (list 10 uint), count: uint, success: bool}))
+    (if (and (get success context) (< index (get count context)))
+        (let ((template-id (get template-id context))
+              (titles (get titles context))
+              (descriptions (get descriptions context))
+              (deliverables (get deliverables context))
+              (percentages (get percentages context)))
+            (map-set template-milestones {template-id: template-id, milestone-index: index} {
+                title: (unwrap-panic (element-at titles index)),
+                description: (unwrap-panic (element-at descriptions index)),
+                deliverables: (unwrap-panic (element-at deliverables index)),
+                percentage: (unwrap-panic (element-at percentages index))
+            })
+            context
+        )
+        context
+    )
+)
+
+(define-private (add-template-to-user (user principal) (template-id uint))
+    (let ((current-templates (get-user-templates user)))
+        (map-set user-templates user (unwrap-panic (as-max-len? (append current-templates template-id) u20)))
+        (ok true)
+    )
+)
+
+(define-public (use-project-template (template-id uint))
+    (let ((template (unwrap! (get-template template-id) err-template-not-found)))
+        (asserts! (get active template) err-template-not-found)
+        
+        (map-set project-templates template-id (merge template {
+            usage-count: (+ (get usage-count template) u1)
+        }))
+        
+        (let ((current-usage (get-template-usage-history template-id)))
+            (map-set template-usage-history template-id 
+                (unwrap-panic (as-max-len? (append current-usage tx-sender) u50)))
+        )
+        
+        (ok template-id)
+    )
+)
+
+(define-public (rate-template (template-id uint) (rating uint) (comment (string-ascii 256)))
+    (let ((template (unwrap! (get-template template-id) err-template-not-found)))
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (get active template) err-template-not-found)
+        
+        (map-set template-reviews {template-id: template-id, reviewer: tx-sender} {
+            rating: rating,
+            comment: comment,
+            created-at: stacks-block-height
+        })
+        
+        (unwrap-panic (update-template-rating template-id rating))
+        (ok true)
+    )
+)
+
+(define-private (update-template-rating (template-id uint) (new-rating uint))
+    (let ((template (unwrap! (get-template template-id) err-template-not-found))
+          (current-rating (get rating template))
+          (usage-count (get usage-count template)))
+        (if (is-eq current-rating u0)
+            (map-set project-templates template-id (merge template {rating: new-rating}))
+            (let ((total-ratings (* current-rating usage-count))
+                  (updated-total (+ total-ratings new-rating))
+                  (new-average (/ updated-total (+ usage-count u1))))
+                (map-set project-templates template-id (merge template {rating: new-average}))
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (deactivate-template (template-id uint))
+    (let ((template (unwrap! (get-template template-id) err-template-not-found)))
+        (asserts! (or (is-eq tx-sender (get creator template)) (is-eq tx-sender contract-owner)) err-unauthorized)
+        
+        (map-set project-templates template-id (merge template {active: false}))
+        (ok true)
+    )
+)
+
+(define-public (clone-template (template-id uint) (new-name (string-ascii 128)))
+    (let ((original-template (unwrap! (get-template template-id) err-template-not-found))
+          (new-template-id (+ (var-get last-template-id) u1)))
+        (asserts! (get active original-template) err-template-not-found)
+        
+        (map-set project-templates new-template-id (merge original-template {
+            creator: tx-sender,
+            name: new-name,
+            created-at: stacks-block-height,
+            usage-count: u0,
+            rating: u0
+        }))
+        
+        (unwrap-panic (add-template-to-user tx-sender new-template-id))
+        
+        (var-set last-template-id new-template-id)
+        (ok new-template-id)
+    )
+)
+
+(define-read-only (calculate-template-compatibility (template-id uint) (freelancer principal))
+    (let ((template (unwrap! (get-template template-id) err-template-not-found))
+          (required-skills (get required-skills template))
+          (missing-skills-result (filter-missing-skills freelancer required-skills)))
+        (ok {
+            template-id: template-id,
+            compatibility-score: (calculate-skill-match freelancer required-skills),
+            missing-skills: (get missing missing-skills-result),
+            estimated-budget: (get total-budget-range template),
+            estimated-duration: (get estimated-duration template)
+        })
+    )
+)
+
+(define-private (calculate-skill-match (freelancer principal) (required-skills (list 5 uint)))
+    (let ((match-count (fold count-skill-matches required-skills {freelancer: freelancer, count: u0})))
+        (/ (* (get count match-count) u100) (len required-skills))
+    )
+)
+
+(define-private (count-skill-matches (skill-id uint) (acc {freelancer: principal, count: uint}))
+    (let ((freelancer (get freelancer acc))
+          (current-count (get count acc)))
+        {freelancer: freelancer, count: (if (is-some (get-freelancer-skill freelancer skill-id)) (+ current-count u1) current-count)}
+    )
+)
+
+(define-private (filter-missing-skills (freelancer principal) (required-skills (list 5 uint)))
+    (fold collect-missing-skills required-skills {freelancer: freelancer, missing: (list)})
+)
+
+(define-private (collect-missing-skills (skill-id uint) (acc {freelancer: principal, missing: (list 5 uint)}))
+    (let ((freelancer (get freelancer acc))
+          (missing-list (get missing acc)))
+        {freelancer: freelancer, 
+         missing: (if (is-none (get-freelancer-skill freelancer skill-id))
+                     (unwrap-panic (as-max-len? (append missing-list skill-id) u5))
+                     missing-list)}
+    )
+)
