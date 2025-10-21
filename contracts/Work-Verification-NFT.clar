@@ -833,3 +833,367 @@
                      missing-list)}
     )
 )
+
+;; Analytics Dashboard System - New Independent Feature
+(define-constant err-invalid-timeframe (err u120))
+(define-constant err-analytics-disabled (err u121))
+(define-constant err-insufficient-data (err u122))
+
+;; Analytics data storage
+(define-data-var analytics-enabled bool true)
+(define-data-var platform-start-height uint u0)
+
+(define-map daily-stats uint {
+    jobs-completed: uint,
+    total-volume: uint,
+    new-freelancers: uint,
+    new-clients: uint,
+    disputes-created: uint,
+    disputes-resolved: uint,
+    milestones-created: uint,
+    milestones-completed: uint,
+    templates-created: uint,
+    templates-used: uint
+})
+
+(define-map monthly-stats uint {
+    total-jobs: uint,
+    total-volume: uint,
+    average-job-rating: uint,
+    active-freelancers: uint,
+    active-clients: uint,
+    platform-fees-collected: uint,
+    top-skill-category: uint,
+    growth-rate: uint
+})
+
+(define-map user-activity-stats principal {
+    first-activity: uint,
+    last-activity: uint,
+    total-transactions: uint,
+    user-type: (string-ascii 20), ;; "client", "freelancer", "both"
+    streak-days: uint,
+    peak-rating: uint
+})
+
+(define-map skill-category-stats uint {
+    total-jobs: uint,
+    total-volume: uint,
+    average-rating: uint,
+    unique-freelancers: uint,
+    growth-trend: (string-ascii 20) ;; "up", "down", "stable"
+})
+
+(define-map platform-milestones uint {
+    milestone-name: (string-ascii 128),
+    target-value: uint,
+    current-value: uint,
+    achieved: bool,
+    achievement-date: (optional uint),
+    category: (string-ascii 32) ;; "volume", "users", "jobs", "quality"
+})
+
+(define-data-var last-milestone-key uint u0)
+
+;; Initialize platform tracking
+(begin
+    (var-set platform-start-height stacks-block-height)
+    ;; Set initial milestones
+    (map-set platform-milestones u1 {
+        milestone-name: "First 100 Jobs Completed",
+        target-value: u100,
+        current-value: u0,
+        achieved: false,
+        achievement-date: none,
+        category: "jobs"
+    })
+    (map-set platform-milestones u2 {
+        milestone-name: "1M STX in Total Volume",
+        target-value: u1000000000000,
+        current-value: u0,
+        achieved: false,
+        achievement-date: none,
+        category: "volume"
+    })
+    (map-set platform-milestones u3 {
+        milestone-name: "500 Active Users",
+        target-value: u500,
+        current-value: u0,
+        achieved: false,
+        achievement-date: none,
+        category: "users"
+    })
+    (var-set last-milestone-key u3)
+)
+
+;; Read-only analytics functions
+(define-read-only (get-daily-stats (day uint))
+    (default-to {
+        jobs-completed: u0,
+        total-volume: u0,
+        new-freelancers: u0,
+        new-clients: u0,
+        disputes-created: u0,
+        disputes-resolved: u0,
+        milestones-created: u0,
+        milestones-completed: u0,
+        templates-created: u0,
+        templates-used: u0
+    } (map-get? daily-stats day))
+)
+
+(define-read-only (get-monthly-stats (month uint))
+    (map-get? monthly-stats month)
+)
+
+(define-read-only (get-user-activity-stats (user principal))
+    (map-get? user-activity-stats user)
+)
+
+(define-read-only (get-skill-category-stats (skill-id uint))
+    (map-get? skill-category-stats skill-id)
+)
+
+(define-read-only (get-platform-milestone (milestone-id uint))
+    (map-get? platform-milestones milestone-id)
+)
+
+(define-read-only (is-analytics-enabled)
+    (var-get analytics-enabled)
+)
+
+(define-read-only (get-platform-overview)
+    (let ((current-day (get-day-from-height stacks-block-height))
+          (total-tokens (var-get last-token-id))
+          (total-disputes (var-get last-dispute-id))
+          (total-milestones (var-get last-milestone-id))
+          (total-templates (var-get last-template-id)))
+        {
+            platform-age-days: (- current-day (get-day-from-height (var-get platform-start-height))),
+            total-jobs: total-tokens,
+            total-disputes: total-disputes,
+            total-milestones: total-milestones,
+            total-templates: total-templates,
+            platform-fee: (var-get platform-fee),
+            analytics-enabled: (var-get analytics-enabled)
+        }
+    )
+)
+
+(define-read-only (get-performance-metrics (timeframe (string-ascii 20)))
+    (if (is-eq timeframe "daily")
+        (get-daily-performance)
+        (if (is-eq timeframe "weekly")
+            (get-weekly-performance)
+            (if (is-eq timeframe "monthly")
+                (get-monthly-performance)
+                (err err-invalid-timeframe)
+            )
+        )
+    )
+)
+
+(define-private (get-day-from-height (height uint))
+    (/ height u144) ;; Approximate blocks per day
+)
+
+(define-private (get-daily-performance)
+    (let ((today (get-day-from-height stacks-block-height))
+          (today-stats (get-daily-stats today))
+          (yesterday-stats (get-daily-stats (- today u1))))
+        (ok {
+            period: "daily",
+            jobs-completed: (get jobs-completed today-stats),
+            volume: (get total-volume today-stats),
+            growth-rate: (calculate-growth-rate 
+                         (get jobs-completed yesterday-stats)
+                         (get jobs-completed today-stats)),
+            new-users: (+ (get new-freelancers today-stats) (get new-clients today-stats))
+        })
+    )
+)
+
+(define-private (get-weekly-performance)
+    (let ((today (get-day-from-height stacks-block-height))
+          (week-stats (aggregate-week-stats today)))
+        (ok {
+            period: "weekly",
+            jobs-completed: (get total-jobs week-stats),
+            volume: (get total-volume week-stats),
+            growth-rate: u0,
+            new-users: (+ (get active-freelancers week-stats) (get active-clients week-stats))
+        })
+    )
+)
+
+(define-private (get-monthly-performance)
+    (let ((current-month (/ (get-day-from-height stacks-block-height) u30))
+          (month-stats (get-monthly-stats current-month)))
+        (ok {
+            period: "monthly",
+            jobs-completed: (match month-stats stats (get total-jobs stats) u0),
+            volume: (match month-stats stats (get total-volume stats) u0),
+            growth-rate: (match month-stats stats (get growth-rate stats) u0),
+            new-users: u0
+        })
+    )
+)
+
+(define-private (aggregate-week-stats (end-day uint))
+    ;; Simplified aggregation - in practice would sum daily stats
+    {
+        total-jobs: u0,
+        total-volume: u0,
+        active-freelancers: u0,
+        active-clients: u0
+    }
+)
+
+(define-private (calculate-growth-rate (previous uint) (current uint))
+    (if (is-eq previous u0)
+        u100 ;; 100% growth from zero
+        (if (> current previous)
+            (/ (* (- current previous) u100) previous)
+            u0
+        )
+    )
+)
+
+;; Analytics update functions (called internally)
+(define-private (update-daily-analytics (job-volume uint) (event-type (string-ascii 20)))
+    (if (var-get analytics-enabled)
+        (let ((today (get-day-from-height stacks-block-height))
+              (current-stats (get-daily-stats today)))
+            (if (is-eq event-type "job-completed")
+                (map-set daily-stats today (merge current-stats {
+                    jobs-completed: (+ (get jobs-completed current-stats) u1),
+                    total-volume: (+ (get total-volume current-stats) job-volume)
+                }))
+                (if (is-eq event-type "dispute-created")
+                    (map-set daily-stats today (merge current-stats {
+                        disputes-created: (+ (get disputes-created current-stats) u1)
+                    }))
+                    (if (is-eq event-type "milestone-completed")
+                        (map-set daily-stats today (merge current-stats {
+                            milestones-completed: (+ (get milestones-completed current-stats) u1)
+                        }))
+                        (map-set daily-stats today (merge current-stats {
+                            templates-used: (+ (get templates-used current-stats) u1)
+                        }))
+                    )
+                )
+            )
+            true
+        )
+        false
+    )
+)
+
+(define-private (update-user-activity (user principal) (activity-type (string-ascii 20)))
+    (if (var-get analytics-enabled)
+        (let ((current-stats (default-to {
+                first-activity: stacks-block-height,
+                last-activity: stacks-block-height,
+                total-transactions: u0,
+                user-type: "unknown",
+                streak-days: u1,
+                peak-rating: u0
+              } (get-user-activity-stats user))))
+            (map-set user-activity-stats user (merge current-stats {
+                last-activity: stacks-block-height,
+                total-transactions: (+ (get total-transactions current-stats) u1),
+                user-type: activity-type
+            }))
+            true
+        )
+        false
+    )
+)
+
+(define-private (check-and-update-milestones (metric-type (string-ascii 20)) (value uint))
+    (let ((milestone-1 (get-platform-milestone u1))
+          (milestone-2 (get-platform-milestone u2)))
+        (match milestone-1
+            m1 (if (and (is-eq metric-type "jobs") (not (get achieved m1)))
+                   (if (>= value (get target-value m1))
+                       (map-set platform-milestones u1 (merge m1 {
+                           current-value: value,
+                           achieved: true,
+                           achievement-date: (some stacks-block-height)
+                       }))
+                       (map-set platform-milestones u1 (merge m1 {
+                           current-value: value
+                       }))
+                   )
+                   true
+               )
+            true
+        )
+        true
+    )
+)
+
+;; Public analytics management functions
+(define-public (toggle-analytics)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set analytics-enabled (not (var-get analytics-enabled)))
+        (ok (var-get analytics-enabled))
+    )
+)
+
+(define-public (create-custom-milestone 
+    (name (string-ascii 128))
+    (target-value uint)
+    (category (string-ascii 32)))
+    (let ((milestone-id (+ (var-get last-milestone-key) u1)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> target-value u0) err-insufficient-funds)
+        
+        (map-set platform-milestones milestone-id {
+            milestone-name: name,
+            target-value: target-value,
+            current-value: u0,
+            achieved: false,
+            achievement-date: none,
+            category: category
+        })
+        
+        (var-set last-milestone-key milestone-id)
+        (ok milestone-id)
+    )
+)
+
+(define-public (export-analytics-snapshot)
+    (begin
+        (asserts! (var-get analytics-enabled) err-analytics-disabled)
+        (let ((overview (get-platform-overview))
+              (daily-perf (unwrap-panic (get-daily-performance)))
+              (milestone-1 (get-platform-milestone u1))
+              (milestone-2 (get-platform-milestone u2)))
+            (ok {
+                snapshot-height: stacks-block-height,
+                platform-overview: overview,
+                daily-performance: daily-perf,
+                key-milestones: {
+                    jobs-milestone: milestone-1,
+                    volume-milestone: milestone-2
+                }
+            })
+        )
+    )
+)
+
+;; Enhanced mint function with analytics tracking
+(define-private (track-job-completion (payment-amount uint))
+    (begin
+        (update-daily-analytics payment-amount "job-completed")
+        (update-user-activity tx-sender "freelancer")
+        (check-and-update-milestones "jobs" (var-get last-token-id))
+        (check-and-update-milestones "volume" payment-amount)
+        true
+    )
+)
+
+;; Integration hooks for existing functions (minimal modifications)
+;; These would be called from existing functions to update analytics
