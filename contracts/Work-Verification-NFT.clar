@@ -838,6 +838,9 @@
 (define-constant err-invalid-timeframe (err u120))
 (define-constant err-analytics-disabled (err u121))
 (define-constant err-insufficient-data (err u122))
+(define-constant err-badge-not-found (err u123))
+(define-constant err-badge-already-earned (err u124))
+(define-constant err-requirements-not-met (err u125))
 
 ;; Analytics data storage
 (define-data-var analytics-enabled bool true)
@@ -1197,3 +1200,430 @@
 
 ;; Integration hooks for existing functions (minimal modifications)
 ;; These would be called from existing functions to update analytics
+
+;; Reputation Badge System - New Independent Feature
+(define-data-var last-badge-id uint u0)
+
+(define-map badge-definitions uint {
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    badge-type: (string-ascii 32),
+    requirement-type: (string-ascii 32),
+    requirement-value: uint,
+    rarity: (string-ascii 20),
+    active: bool,
+    created-at: uint
+})
+
+(define-map user-badges {user: principal, badge-id: uint} {
+    earned-at: uint,
+    progress-value: uint,
+    tier: uint,
+    visible: bool
+})
+
+(define-map badge-holders uint (list 100 principal))
+(define-map user-badge-list principal (list 50 uint))
+
+(define-map badge-progress {user: principal, badge-id: uint} {
+    current-value: uint,
+    last-updated: uint,
+    locked: bool
+})
+
+(begin
+    (map-set badge-definitions u1 {
+        name: "First Steps",
+        description: "Complete your first job on the platform",
+        badge-type: "achievement",
+        requirement-type: "jobs-completed",
+        requirement-value: u1,
+        rarity: "common",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u2 {
+        name: "Rising Star",
+        description: "Earn a 5-star average rating across 10 jobs",
+        badge-type: "achievement",
+        requirement-type: "rating-milestone",
+        requirement-value: u10,
+        rarity: "rare",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u3 {
+        name: "Veteran Freelancer",
+        description: "Successfully complete 50 jobs",
+        badge-type: "achievement",
+        requirement-type: "jobs-completed",
+        requirement-value: u50,
+        rarity: "epic",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u4 {
+        name: "High Earner",
+        description: "Accumulate 100,000 STX in total earnings",
+        badge-type: "achievement",
+        requirement-type: "total-earnings",
+        requirement-value: u100000000000,
+        rarity: "epic",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u5 {
+        name: "Trusted Client",
+        description: "Post and complete 25 jobs as a client",
+        badge-type: "achievement",
+        requirement-type: "client-jobs",
+        requirement-value: u25,
+        rarity: "rare",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u6 {
+        name: "Master Specialist",
+        description: "Earn certification in 5 different skills",
+        badge-type: "achievement",
+        requirement-type: "certifications",
+        requirement-value: u5,
+        rarity: "legendary",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u7 {
+        name: "Dispute Resolver",
+        description: "Complete 20 jobs without any disputes",
+        badge-type: "achievement",
+        requirement-type: "dispute-free",
+        requirement-value: u20,
+        rarity: "rare",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (map-set badge-definitions u8 {
+        name: "Early Adopter",
+        description: "Join platform within first 1000 blocks",
+        badge-type: "special",
+        requirement-type: "early-join",
+        requirement-value: u1000,
+        rarity: "legendary",
+        active: true,
+        created-at: stacks-block-height
+    })
+    (var-set last-badge-id u8)
+)
+
+(define-read-only (get-badge-definition (badge-id uint))
+    (map-get? badge-definitions badge-id)
+)
+
+(define-read-only (get-user-badge (user principal) (badge-id uint))
+    (map-get? user-badges {user: user, badge-id: badge-id})
+)
+
+(define-read-only (get-badge-progress (user principal) (badge-id uint))
+    (map-get? badge-progress {user: user, badge-id: badge-id})
+)
+
+(define-read-only (get-user-badges (user principal))
+    (default-to (list) (map-get? user-badge-list user))
+)
+
+(define-read-only (get-badge-holders (badge-id uint))
+    (default-to (list) (map-get? badge-holders badge-id))
+)
+
+(define-read-only (get-badge-count (user principal))
+    (len (get-user-badges user))
+)
+
+(define-read-only (has-badge (user principal) (badge-id uint))
+    (is-some (get-user-badge user badge-id))
+)
+
+(define-read-only (get-all-active-badges)
+    (let ((badge-ids (list u1 u2 u3 u4 u5 u6 u7 u8)))
+        (filter is-active-badge badge-ids)
+    )
+)
+
+(define-private (is-active-badge (badge-id uint))
+    (match (get-badge-definition badge-id)
+        badge (get active badge)
+        false
+    )
+)
+
+(define-read-only (check-badge-eligibility (user principal) (badge-id uint))
+    (let ((badge-def (unwrap! (get-badge-definition badge-id) (err err-badge-not-found)))
+          (user-reputation (get-reputation-score user))
+          (user-earnings (get-total-earnings user))
+          (requirement-type (get requirement-type badge-def))
+          (requirement-value (get requirement-value badge-def)))
+        (if (is-some (get-user-badge user badge-id))
+            (err err-badge-already-earned)
+            (ok (check-requirement user requirement-type requirement-value user-reputation user-earnings))
+        )
+    )
+)
+
+(define-private (check-requirement 
+    (user principal) 
+    (req-type (string-ascii 32)) 
+    (req-value uint) 
+    (reputation (optional {total-jobs: uint, average-rating: uint, total-earnings: uint})) 
+    (earnings uint))
+    (if (is-eq req-type "jobs-completed")
+        (match reputation
+            rep (>= (get total-jobs rep) req-value)
+            false
+        )
+        (if (is-eq req-type "rating-milestone")
+            (match reputation
+                rep (and (>= (get total-jobs rep) req-value) (is-eq (get average-rating rep) u5))
+                false
+            )
+            (if (is-eq req-type "total-earnings")
+                (>= earnings req-value)
+                (if (is-eq req-type "client-jobs")
+                    (>= (len (get-client-jobs user)) req-value)
+                    (if (is-eq req-type "certifications")
+                        (>= (get count (count-certifications user)) req-value)
+                        (if (is-eq req-type "dispute-free")
+                            (check-dispute-free-streak user req-value)
+                            (if (is-eq req-type "early-join")
+                                (check-early-adopter user req-value)
+                                false
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-private (count-certifications (user principal))
+    (let ((skill-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
+        (fold count-certified-skills skill-ids {user: user, count: u0})
+    )
+)
+
+(define-private (count-certified-skills (skill-id uint) (acc {user: principal, count: uint}))
+    (let ((user (get user acc))
+          (current-count (get count acc)))
+        {user: user, count: (if (is-skill-certified user skill-id) (+ current-count u1) current-count)}
+    )
+)
+
+(define-private (is-skill-certified (user principal) (skill-id uint))
+    (match (get-freelancer-skill user skill-id)
+        skill (get certified skill)
+        false
+    )
+)
+
+(define-private (check-dispute-free-streak (user principal) (required-jobs uint))
+    (let ((portfolio (get-freelancer-portfolio user))
+          (recent-jobs (if (> (len portfolio) required-jobs)
+                          (unwrap-panic (slice? portfolio (- (len portfolio) required-jobs) (len portfolio)))
+                          portfolio)))
+        (and 
+            (>= (len recent-jobs) required-jobs)
+            (is-eq (fold count-disputes recent-jobs u0) u0)
+        )
+    )
+)
+
+(define-private (count-disputes (token-id uint) (acc uint))
+    (match (get-work-metadata token-id)
+        metadata (if (is-some (get dispute-id metadata)) (+ acc u1) acc)
+        acc
+    )
+)
+
+(define-private (check-early-adopter (user principal) (block-limit uint))
+    (match (get-user-activity-stats user)
+        stats (<= (- (get first-activity stats) (var-get platform-start-height)) block-limit)
+        false
+    )
+)
+
+(define-public (award-badge (user principal) (badge-id uint))
+    (let ((badge-def (unwrap! (get-badge-definition badge-id) err-badge-not-found))
+          (eligible (unwrap! (check-badge-eligibility user badge-id) err-requirements-not-met)))
+        (asserts! (get active badge-def) err-badge-not-found)
+        (asserts! eligible err-requirements-not-met)
+        
+        (map-set user-badges {user: user, badge-id: badge-id} {
+            earned-at: stacks-block-height,
+            progress-value: (get requirement-value badge-def),
+            tier: u1,
+            visible: true
+        })
+        
+        (let ((user-badge-ids (get-user-badges user)))
+            (map-set user-badge-list user 
+                (unwrap-panic (as-max-len? (append user-badge-ids badge-id) u50)))
+        )
+        
+        (let ((holders (get-badge-holders badge-id)))
+            (map-set badge-holders badge-id 
+                (unwrap-panic (as-max-len? (append holders user) u100)))
+        )
+        
+        (ok badge-id)
+    )
+)
+
+(define-public (claim-badge (badge-id uint))
+    (award-badge tx-sender badge-id)
+)
+
+(define-public (auto-check-and-award-badges (user principal))
+    (let ((badge-ids (list u1 u2 u3 u4 u5 u6 u7 u8)))
+        (fold check-and-award-single-badge badge-ids {user: user, badges-earned: (list)})
+        (ok true)
+    )
+)
+
+(define-private (check-and-award-single-badge 
+    (badge-id uint) 
+    (context {user: principal, badges-earned: (list 10 uint)}))
+    (let ((user (get user context))
+          (badges (get badges-earned context)))
+        (match (check-badge-eligibility user badge-id)
+            ok-result (if ok-result
+                         (begin
+                             (unwrap-panic (award-badge user badge-id))
+                             {user: user, badges-earned: (unwrap-panic (as-max-len? (append badges badge-id) u10))}
+                         )
+                         context
+                     )
+            err-result context
+        )
+    )
+)
+
+(define-public (update-badge-visibility (badge-id uint) (visible bool))
+    (let ((user-badge (unwrap! (get-user-badge tx-sender badge-id) err-badge-not-found)))
+        (map-set user-badges {user: tx-sender, badge-id: badge-id} 
+            (merge user-badge {visible: visible}))
+        (ok true)
+    )
+)
+
+(define-public (create-custom-badge
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (badge-type (string-ascii 32))
+    (requirement-type (string-ascii 32))
+    (requirement-value uint)
+    (rarity (string-ascii 20)))
+    (let ((badge-id (+ (var-get last-badge-id) u1)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> requirement-value u0) err-requirements-not-met)
+        
+        (map-set badge-definitions badge-id {
+            name: name,
+            description: description,
+            badge-type: badge-type,
+            requirement-type: requirement-type,
+            requirement-value: requirement-value,
+            rarity: rarity,
+            active: true,
+            created-at: stacks-block-height
+        })
+        
+        (var-set last-badge-id badge-id)
+        (ok badge-id)
+    )
+)
+
+(define-public (deactivate-badge (badge-id uint))
+    (let ((badge (unwrap! (get-badge-definition badge-id) err-badge-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set badge-definitions badge-id (merge badge {active: false}))
+        (ok true)
+    )
+)
+
+(define-read-only (get-user-badge-showcase (user principal))
+    (let ((all-badges (get-user-badges user)))
+        {
+            total-badges: (len all-badges),
+            visible-badges: (filter-visible-badges user all-badges),
+            badge-count-by-rarity: (count-badges-by-rarity user all-badges),
+            latest-badge: (get-latest-badge user all-badges)
+        }
+    )
+)
+
+(define-private (filter-visible-badges (user principal) (badge-ids (list 50 uint)))
+    (fold collect-visible-badges badge-ids {user: user, visible: (list)})
+)
+
+(define-private (collect-visible-badges (badge-id uint) (acc {user: principal, visible: (list 50 uint)}))
+    (let ((user (get user acc))
+          (visible-list (get visible acc)))
+        {user: user, 
+         visible: (if (is-badge-visible user badge-id)
+                     (unwrap-panic (as-max-len? (append visible-list badge-id) u50))
+                     visible-list)}
+    )
+)
+
+(define-private (is-badge-visible (user principal) (badge-id uint))
+    (match (get-user-badge user badge-id)
+        badge (get visible badge)
+        false
+    )
+)
+
+(define-private (count-badges-by-rarity (user principal) (badge-ids (list 50 uint)))
+    (fold accumulate-rarity badge-ids {user: user, common: u0, rare: u0, epic: u0, legendary: u0})
+)
+
+(define-private (accumulate-rarity 
+    (badge-id uint) 
+    (acc {user: principal, common: uint, rare: uint, epic: uint, legendary: uint}))
+    (match (get-user-badge (get user acc) badge-id)
+        user-badge (match (get-badge-definition badge-id)
+                       badge-def (let ((rarity (get rarity badge-def)))
+                                     (if (is-eq rarity "common")
+                                         (merge acc {common: (+ (get common acc) u1)})
+                                         (if (is-eq rarity "rare")
+                                             (merge acc {rare: (+ (get rare acc) u1)})
+                                             (if (is-eq rarity "epic")
+                                                 (merge acc {epic: (+ (get epic acc) u1)})
+                                                 (if (is-eq rarity "legendary")
+                                                     (merge acc {legendary: (+ (get legendary acc) u1)})
+                                                     acc
+                                                 )
+                                             )
+                                         )
+                                     )
+                                 )
+                       acc
+                   )
+        acc
+    )
+)
+
+(define-private (get-latest-badge (user principal) (badge-ids (list 50 uint)))
+    (fold find-latest-badge badge-ids {user: user, latest-id: u0, latest-height: u0})
+)
+
+(define-private (find-latest-badge 
+    (badge-id uint) 
+    (acc {user: principal, latest-id: uint, latest-height: uint}))
+    (match (get-user-badge (get user acc) badge-id)
+        badge (if (> (get earned-at badge) (get latest-height acc))
+                  {user: (get user acc), latest-id: badge-id, latest-height: (get earned-at badge)}
+                  acc
+              )
+        acc
+    )
+)
